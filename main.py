@@ -18,13 +18,14 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS for ChatGPT
+# Enable CORS for ChatGPT integration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 
 # Database model
@@ -190,6 +191,24 @@ async def health():
             "status": "unhealthy", 
             "error": str(e)
         }
+
+@app.get("/capabilities")
+async def capabilities():
+    """MCP server capabilities endpoint"""
+    return {
+        "capabilities": {
+            "tools": True,
+            "resources": False,
+            "prompts": False,
+            "logging": False
+        },
+        "serverInfo": {
+            "name": "ChatGPT MCP Server",
+            "version": "1.0.0",
+            "protocolVersion": "2024-11-05"
+        },
+        "instructions": "This server provides user management tools for ChatGPT integration"
+    }
 
 @app.get("/tools")
 async def list_tools():
