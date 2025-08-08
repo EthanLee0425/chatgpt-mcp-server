@@ -101,7 +101,25 @@ class CloudDatabase:
 # Global database instance
 db = CloudDatabase()
 
-# Request/Response models
+# JSON-RPC 2.0 Models
+class JSONRPCRequest(BaseModel):
+    jsonrpc: str = "2.0"
+    id: Any = None
+    method: str
+    params: Dict[str, Any] = {}
+
+class JSONRPCResponse(BaseModel):
+    jsonrpc: str = "2.0"
+    id: Any = None
+    result: Any = None
+    error: Dict[str, Any] = None
+
+class JSONRPCError(BaseModel):
+    code: int
+    message: str
+    data: Any = None
+
+# Legacy models for backward compatibility
 class MCPToolCall(BaseModel):
     name: str
     arguments: Dict[str, Any]
@@ -231,101 +249,20 @@ async def sse_endpoint():
     import asyncio
     
     async def event_stream():
-        # Send complete MCP server specification as required by OpenAI
+        # Send MCP compliant server capabilities - following official MCP protocol
         mcp_spec = {
             "capabilities": {
-                "tools": True,
-                "resources": False,
-                "prompts": False,
-                "logging": False
+                "tools": {
+                    "listChanged": True
+                },
+                "resources": {},
+                "prompts": {},
+                "logging": {}
             },
             "serverInfo": {
                 "name": "ChatGPT MCP Server",
                 "version": "1.0.0",
                 "protocolVersion": "2024-11-05"
-            },
-            "instructions": "This server provides user management tools for ChatGPT deep research integration",
-            # Required: tools structure when capabilities.tools = true
-            "tools": {
-                "baseUrl": f"https://chatgpt-mcp-server-production-d35b.up.railway.app",
-                "operations": [
-                    {
-                        "name": "search",
-                        "description": "Search for users in the database. Returns a list of potentially relevant users based on the search query (REQUIRED for ChatGPT Deep Research)",
-                        "method": "POST",
-                        "endpoint": "/call",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string", "const": "search"},
-                                "arguments": {
-                                    "type": "object",
-                                    "properties": {
-                                        "query": {
-                                            "type": "string", 
-                                            "description": "Search query string for user names or email addresses"
-                                        }
-                                    },
-                                    "required": ["query"]
-                                }
-                            },
-                            "required": ["name", "arguments"]
-                        },
-                        "outputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "results": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "id": {"type": "string"},
-                                            "title": {"type": "string"},
-                                            "text": {"type": "string"},
-                                            "url": {"type": "string"}
-                                        },
-                                        "required": ["id", "title", "text", "url"]
-                                    }
-                                }
-                            },
-                            "required": ["results"]
-                        }
-                    },
-                    {
-                        "name": "fetch",
-                        "description": "Retrieve complete user details by unique identifier. Returns full user profile information (REQUIRED for ChatGPT Deep Research)",
-                        "method": "POST", 
-                        "endpoint": "/call",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string", "const": "fetch"},
-                                "arguments": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": {
-                                            "type": "string",
-                                            "description": "Unique identifier for the user (user ID or email address)"
-                                        }
-                                    },
-                                    "required": ["id"]
-                                }
-                            },
-                            "required": ["name", "arguments"]
-                        },
-                        "outputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "id": {"type": "string"},
-                                "title": {"type": "string"},
-                                "text": {"type": "string"},
-                                "url": {"type": "string"},
-                                "metadata": {"type": "object"}
-                            },
-                            "required": ["id", "title", "text", "url"]
-                        }
-                    }
-                ]
             }
         }
         
@@ -365,9 +302,100 @@ async def capabilities():
         "instructions": "This server provides user management tools for ChatGPT integration"
     }
 
+# JSON-RPC 2.0 endpoint for MCP protocol
+@app.post("/mcp")
+async def mcp_jsonrpc(request: JSONRPCRequest) -> JSONRPCResponse:
+    """MCP JSON-RPC 2.0 endpoint"""
+    try:
+        if request.method == "tools/list":
+            # Return MCP compliant tools list
+            tools = [
+                {
+                    "name": "search",
+                    "description": "Search for users in the database. Returns a list of potentially relevant users based on the search query (REQUIRED for ChatGPT Deep Research)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string", 
+                                "description": "Search query string for user names or email addresses"
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                },
+                {
+                    "name": "fetch",
+                    "description": "Retrieve complete user details by unique identifier. Returns full user profile information (REQUIRED for ChatGPT Deep Research)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "description": "Unique identifier for the user (user ID or email address)"
+                            }
+                        },
+                        "required": ["id"]
+                    }
+                }
+            ]
+            
+            return JSONRPCResponse(
+                id=request.id,
+                result={"tools": tools}
+            )
+            
+        elif request.method == "tools/call":
+            # Handle tool execution via JSON-RPC
+            params = request.params
+            tool_name = params.get("name")
+            arguments = params.get("arguments", {})
+            
+            if tool_name == "search":
+                search_result = await execute_search(arguments)
+                return JSONRPCResponse(
+                    id=request.id,
+                    result=search_result
+                )
+                
+            elif tool_name == "fetch":
+                fetch_result = await execute_fetch(arguments)
+                return JSONRPCResponse(
+                    id=request.id,
+                    result=fetch_result
+                )
+            else:
+                return JSONRPCResponse(
+                    id=request.id,
+                    error={
+                        "code": -32601,
+                        "message": f"Method not found: {tool_name}",
+                        "data": {"available_tools": ["search", "fetch"]}
+                    }
+                )
+        else:
+            return JSONRPCResponse(
+                id=request.id,
+                error={
+                    "code": -32601,
+                    "message": f"Method not found: {request.method}",
+                    "data": {"available_methods": ["tools/list", "tools/call"]}
+                }
+            )
+            
+    except Exception as e:
+        return JSONRPCResponse(
+            id=request.id,
+            error={
+                "code": -32603,
+                "message": "Internal error",
+                "data": str(e)
+            }
+        )
+
 @app.get("/tools")
 async def list_tools():
-    """List all available MCP tools"""
+    """List all available MCP tools (Legacy endpoint)"""
     tools = [
         {
             "name": "search",
