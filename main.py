@@ -138,8 +138,14 @@ async def execute_search(arguments: dict) -> dict:
 
 async def execute_fetch(arguments: dict) -> dict:
     """Execute fetch tool - OpenAI format compliance"""
-    identifier = arguments.get("identifier") or arguments.get("id", "")
-    id_type = arguments.get("type", "id")
+    # OpenAI format uses 'id' parameter name
+    identifier = arguments.get("id", "")
+    if not identifier:
+        # Fallback for compatibility
+        identifier = arguments.get("identifier", "")
+        
+    # Auto-detect type based on content
+    id_type = "email" if "@" in identifier else "id"
     
     user = None
     if id_type == "id" or identifier.isdigit():
@@ -378,37 +384,14 @@ async def call_tool(request: MCPToolCall) -> MCPResponse:
         arguments = request.arguments
         
         if name == "search":
+            # Return the raw dictionary format as required by OpenAI
             search_result = await execute_search(arguments)
-            # Convert to string for compatibility
-            if isinstance(search_result, dict) and "results" in search_result:
-                results = search_result["results"]
-                if not results:
-                    result = f"No users found for: {arguments.get('query', 'unknown query')}"
-                else:
-                    result = f"Found {len(results)} users:\n\n"
-                    for item in results:
-                        result += f"• {item['title']}\n"
-                        result += f"  {item['text']}\n"
-                        result += f"  ID: {item['id']}\n\n"
-            else:
-                result = str(search_result)
+            return MCPResponse(result=search_result)
                 
         elif name == "fetch":
-            # Handle both old and new parameter formats
-            fetch_args = arguments.copy()
-            if "id" in arguments:
-                fetch_args["identifier"] = arguments["id"]
-                fetch_args["type"] = "id"
-                
-            fetch_result = await execute_fetch(fetch_args)
-            # Convert to string for compatibility
-            if isinstance(fetch_result, dict):
-                if fetch_result.get("title") == "User Not Found":
-                    result = f"Error: {fetch_result['text']}"
-                else:
-                    result = f"{fetch_result['title']}\n\n{fetch_result['text']}"
-            else:
-                result = str(fetch_result)
+            # Return the raw dictionary format as required by OpenAI
+            fetch_result = await execute_fetch(arguments)
+            return MCPResponse(result=fetch_result)
         elif name == "create_user":
             user = User(**arguments)
             created = db.create_user(user)
