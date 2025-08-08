@@ -231,8 +231,8 @@ async def sse_endpoint():
     import asyncio
     
     async def event_stream():
-        # Send server capabilities
-        capabilities = {
+        # Send complete MCP server specification as required by OpenAI
+        mcp_spec = {
             "capabilities": {
                 "tools": True,
                 "resources": False,
@@ -244,10 +244,92 @@ async def sse_endpoint():
                 "version": "1.0.0",
                 "protocolVersion": "2024-11-05"
             },
-            "instructions": "This server provides user management tools for ChatGPT deep research integration"
+            "instructions": "This server provides user management tools for ChatGPT deep research integration",
+            # Required: tools structure when capabilities.tools = true
+            "tools": {
+                "baseUrl": f"https://chatgpt-mcp-server-production-d35b.up.railway.app",
+                "operations": [
+                    {
+                        "name": "search",
+                        "description": "Search for users in the database. Returns a list of potentially relevant users based on the search query (REQUIRED for ChatGPT Deep Research)",
+                        "method": "POST",
+                        "endpoint": "/call",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "const": "search"},
+                                "arguments": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {
+                                            "type": "string", 
+                                            "description": "Search query string for user names or email addresses"
+                                        }
+                                    },
+                                    "required": ["query"]
+                                }
+                            },
+                            "required": ["name", "arguments"]
+                        },
+                        "outputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "results": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": {"type": "string"},
+                                            "title": {"type": "string"},
+                                            "text": {"type": "string"},
+                                            "url": {"type": "string"}
+                                        },
+                                        "required": ["id", "title", "text", "url"]
+                                    }
+                                }
+                            },
+                            "required": ["results"]
+                        }
+                    },
+                    {
+                        "name": "fetch",
+                        "description": "Retrieve complete user details by unique identifier. Returns full user profile information (REQUIRED for ChatGPT Deep Research)",
+                        "method": "POST", 
+                        "endpoint": "/call",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "const": "fetch"},
+                                "arguments": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {
+                                            "type": "string",
+                                            "description": "Unique identifier for the user (user ID or email address)"
+                                        }
+                                    },
+                                    "required": ["id"]
+                                }
+                            },
+                            "required": ["name", "arguments"]
+                        },
+                        "outputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "title": {"type": "string"},
+                                "text": {"type": "string"},
+                                "url": {"type": "string"},
+                                "metadata": {"type": "object"}
+                            },
+                            "required": ["id", "title", "text", "url"]
+                        }
+                    }
+                ]
+            }
         }
         
-        yield f"data: {json.dumps(capabilities)}\n\n"
+        yield f"data: {json.dumps(mcp_spec)}\n\n"
         
         # Keep connection alive with heartbeat
         while True:
