@@ -111,8 +111,8 @@ class MCPResponse(BaseModel):
     error: str = None
 
 # Tool execution functions
-async def execute_search(arguments: dict) -> str:
-    """Execute search tool"""
+async def execute_search(arguments: dict) -> dict:
+    """Execute search tool - OpenAI format compliance"""
     query = arguments.get("query", "").lower()
     limit = arguments.get("limit", 10)
     
@@ -121,42 +121,64 @@ async def execute_search(arguments: dict) -> str:
     
     for user in users:
         if query in user.name.lower() or query in user.email.lower():
-            results.append(user)
+            # Format according to OpenAI specification
+            result = {
+                "id": str(user.id),
+                "title": f"User: {user.name}",
+                "text": f"User {user.name} with email {user.email}. Contact information and profile details available.",
+                "url": f"https://chatgpt-mcp-server-production-d35b.up.railway.app/users/{user.id}"
+            }
+            results.append(result)
+            
         if len(results) >= limit:
             break
     
-    if not results:
-        return f"No users found for: {query}"
-    
-    response = f"Found {len(results)} users matching '{query}':\n"
-    for user in results:
-        response += f"- ID: {user.id}, Name: {user.name}, Email: {user.email}\n"
-    
-    return response
+    # Return in OpenAI required format
+    return {"results": results}
 
-async def execute_fetch(arguments: dict) -> str:
-    """Execute fetch tool"""
-    identifier = arguments["identifier"]
-    id_type = arguments["type"]
+async def execute_fetch(arguments: dict) -> dict:
+    """Execute fetch tool - OpenAI format compliance"""
+    identifier = arguments.get("identifier") or arguments.get("id", "")
+    id_type = arguments.get("type", "id")
     
-    if id_type == "id":
+    user = None
+    if id_type == "id" or identifier.isdigit():
         try:
             user_id = int(identifier)
             user = db.get_user(user_id)
         except ValueError:
-            return f"Invalid ID: {identifier}"
-    elif id_type == "email":
+            pass
+    elif id_type == "email" or "@" in identifier:
         users = db.get_users()
-        user = None
         for u in users:
             if u.email.lower() == identifier.lower():
                 user = u
                 break
     
     if user:
-        return f"User Details:\nID: {user.id}\nName: {user.name}\nEmail: {user.email}"
+        # Format according to OpenAI specification
+        return {
+            "id": str(user.id),
+            "title": f"User Profile: {user.name}",
+            "text": f"Complete user profile for {user.name}\n\nContact Information:\n- Email: {user.email}\n- User ID: {user.id}\n\nProfile Status: Active\nAccount Type: Standard User\n\nThis user record contains basic contact and identification information.",
+            "url": f"https://chatgpt-mcp-server-production-d35b.up.railway.app/users/{user.id}",
+            "metadata": {
+                "user_id": user.id,
+                "name": user.name,
+                "email": user.email,
+                "account_type": "standard",
+                "status": "active"
+            }
+        }
     else:
-        return f"User not found: {identifier}"
+        # Return error in expected format
+        return {
+            "id": identifier,
+            "title": "User Not Found",
+            "text": f"No user found with identifier: {identifier}",
+            "url": None,
+            "metadata": None
+        }
 
 # API endpoints
 @app.get("/")
@@ -192,6 +214,51 @@ async def health():
             "error": str(e)
         }
 
+@app.get("/sse/")
+async def sse_endpoint():
+    """
+    SSE (Server-Sent Events) endpoint as required by OpenAI MCP specification
+    This is the streaming interface that ChatGPT uses to connect
+    """
+    from fastapi.responses import StreamingResponse
+    import json
+    import asyncio
+    
+    async def event_stream():
+        # Send server capabilities
+        capabilities = {
+            "capabilities": {
+                "tools": True,
+                "resources": False,
+                "prompts": False,
+                "logging": False
+            },
+            "serverInfo": {
+                "name": "ChatGPT MCP Server",
+                "version": "1.0.0",
+                "protocolVersion": "2024-11-05"
+            },
+            "instructions": "This server provides user management tools for ChatGPT deep research integration"
+        }
+        
+        yield f"data: {json.dumps(capabilities)}\n\n"
+        
+        # Keep connection alive with heartbeat
+        while True:
+            await asyncio.sleep(30)
+            heartbeat = {"type": "heartbeat", "timestamp": asyncio.get_event_loop().time()}
+            yield f"data: {json.dumps(heartbeat)}\n\n"
+    
+    return StreamingResponse(
+        event_stream(), 
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*"
+        }
+    )
+
 @app.get("/capabilities")
 async def capabilities():
     """MCP server capabilities endpoint"""
@@ -216,26 +283,30 @@ async def list_tools():
     tools = [
         {
             "name": "search",
-            "description": "Search users by name or email (REQUIRED for ChatGPT)",
+            "description": "Search for users in the database. Returns a list of potentially relevant users based on the search query (REQUIRED for ChatGPT Deep Research)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "limit": {"type": "integer", "description": "Max results", "default": 10}
+                    "query": {
+                        "type": "string", 
+                        "description": "Search query string for user names or email addresses"
+                    }
                 },
                 "required": ["query"]
             }
         },
         {
             "name": "fetch",
-            "description": "Fetch user details by ID or email (REQUIRED for ChatGPT)",
+            "description": "Retrieve complete user details by unique identifier. Returns full user profile information (REQUIRED for ChatGPT Deep Research)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "identifier": {"type": "string", "description": "User ID or email"},
-                    "type": {"type": "string", "enum": ["id", "email"], "description": "Identifier type"}
+                    "id": {
+                        "type": "string",
+                        "description": "Unique identifier for the user (user ID or email address)"
+                    }
                 },
-                "required": ["identifier", "type"]
+                "required": ["id"]
             }
         },
         {
@@ -307,9 +378,37 @@ async def call_tool(request: MCPToolCall) -> MCPResponse:
         arguments = request.arguments
         
         if name == "search":
-            result = await execute_search(arguments)
+            search_result = await execute_search(arguments)
+            # Convert to string for compatibility
+            if isinstance(search_result, dict) and "results" in search_result:
+                results = search_result["results"]
+                if not results:
+                    result = f"No users found for: {arguments.get('query', 'unknown query')}"
+                else:
+                    result = f"Found {len(results)} users:\n\n"
+                    for item in results:
+                        result += f"• {item['title']}\n"
+                        result += f"  {item['text']}\n"
+                        result += f"  ID: {item['id']}\n\n"
+            else:
+                result = str(search_result)
+                
         elif name == "fetch":
-            result = await execute_fetch(arguments)
+            # Handle both old and new parameter formats
+            fetch_args = arguments.copy()
+            if "id" in arguments:
+                fetch_args["identifier"] = arguments["id"]
+                fetch_args["type"] = "id"
+                
+            fetch_result = await execute_fetch(fetch_args)
+            # Convert to string for compatibility
+            if isinstance(fetch_result, dict):
+                if fetch_result.get("title") == "User Not Found":
+                    result = f"Error: {fetch_result['text']}"
+                else:
+                    result = f"{fetch_result['title']}\n\n{fetch_result['text']}"
+            else:
+                result = str(fetch_result)
         elif name == "create_user":
             user = User(**arguments)
             created = db.create_user(user)
