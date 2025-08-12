@@ -1,42 +1,33 @@
 #!/usr/bin/env python3
 """
-Railway.app Deployment Version
-Optimized for cloud deployment with Railway
+FastMCP 相容版本的 MCP 伺服器
+基於官方範例改寫，使用自定義資料庫而非 Vector Store
 """
 
-from fastapi import FastAPI, HTTPException
+import logging
+import os
+import asyncio
+import json
+from typing import Dict, List, Any
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, Any, List, Optional
-import uvicorn
 import sqlite3
-import os
 
-app = FastAPI(
-    title="ChatGPT MCP Server",
-    description="User Management MCP Server for ChatGPT integration",
-    version="1.0.0"
-)
-
-# Enable CORS for ChatGPT integration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"]
-)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Database model
 class User(BaseModel):
-    id: Optional[int] = None
+    id: int = None
     name: str
     email: str
 
-# Simple database class for cloud deployment
-class CloudDatabase:
-    def __init__(self, db_path: str = "cloud_users.db"):
+# Database class
+class UserDatabase:
+    def __init__(self, db_path: str = "users.db"):
         self.db_path = db_path
         self.init_db()
     
@@ -51,17 +42,6 @@ class CloudDatabase:
             """)
             conn.commit()
 
-    def create_user(self, user: User) -> User:
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO users (name, email) VALUES (?, ?)",
-                (user.name, user.email)
-            )
-            user.id = cursor.lastrowid
-            conn.commit()
-            return user
-
     def get_users(self) -> List[User]:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -69,77 +49,65 @@ class CloudDatabase:
             rows = cursor.fetchall()
             return [User(id=row[0], name=row[1], email=row[2]) for row in rows]
 
-    def get_user(self, user_id: int) -> Optional[User]:
+    def get_user(self, user_id: int) -> User:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT id, name, email FROM users WHERE id = ?", (user_id,))
             row = cursor.fetchone()
             return User(id=row[0], name=row[1], email=row[2]) if row else None
 
-    def update_user(self, user_id: int, user: User) -> Optional[User]:
+    def create_user(self, user: User) -> User:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE users SET name = ?, email = ? WHERE id = ?",
-                (user.name, user.email, user_id)
-            )
-            if cursor.rowcount > 0:
-                conn.commit()
-                user.id = user_id
-                return user
-            return None
+            cursor.execute("INSERT INTO users (name, email) VALUES (?, ?)", (user.name, user.email))
+            user.id = cursor.lastrowid
+            conn.commit()
+            return user
 
-    def delete_user(self, user_id: int) -> bool:
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
-            success = cursor.rowcount > 0
-            if success:
-                conn.commit()
-            return success
+# Global database
+db = UserDatabase()
 
-# Global database instance
-db = CloudDatabase()
+# Initialize with sample data
+try:
+    users = db.get_users()
+    if len(users) == 0:
+        sample_users = [
+            User(name="Alice Johnson", email="alice@example.com"),
+            User(name="Bob Smith", email="bob@example.com"),
+            User(name="Carol Brown", email="carol@test.com"),
+            User(name="David Wilson", email="david@demo.com"),
+            User(name="Eva Garcia", email="eva@sample.com")
+        ]
+        for user in sample_users:
+            try:
+                db.create_user(user)
+            except:
+                pass
+        logger.info(f"Initialized with {len(sample_users)} sample users")
+except Exception as e:
+    logger.warning(f"Database initialization warning: {e}")
 
-# JSON-RPC 2.0 Models
-class JSONRPCRequest(BaseModel):
-    jsonrpc: str = "2.0"
-    id: Any = None
-    method: str
-    params: Dict[str, Any] = {}
-
-class JSONRPCResponse(BaseModel):
-    jsonrpc: str = "2.0"
-    id: Any = None
-    result: Any = None
-    error: Dict[str, Any] = None
-
-class JSONRPCError(BaseModel):
-    code: int
-    message: str
-    data: Any = None
-
-# Legacy models for backward compatibility
-class MCPToolCall(BaseModel):
-    name: str
-    arguments: Dict[str, Any]
-
-class MCPResponse(BaseModel):
-    result: Any = None
-    error: str = None
-
-# Tool execution functions
-async def execute_search(arguments: dict) -> dict:
-    """Execute search tool - OpenAI format compliance"""
-    query = arguments.get("query", "").lower()
-    limit = arguments.get("limit", 10)
+# MCP Tools Implementation (模擬 FastMCP 的 @mcp.tool() 裝飾器行為)
+async def search(query: str) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Search for users in the database.
     
+    Args:
+        query: Search query string for user names or email addresses
+        
+    Returns:
+        Dictionary with 'results' key containing list of matching users.
+        Each result includes id, title, text snippet, and optional URL.
+    """
+    if not query or not query.strip():
+        return {"results": []}
+    
+    query = query.lower()
     users = db.get_users()
     results = []
     
     for user in users:
         if query in user.name.lower() or query in user.email.lower():
-            # Format according to OpenAI specification
             result = {
                 "id": str(user.id),
                 "title": f"User: {user.name}",
@@ -148,40 +116,45 @@ async def execute_search(arguments: dict) -> dict:
             }
             results.append(result)
             
-        if len(results) >= limit:
+        if len(results) >= 10:  # Limit results
             break
     
-    # Return in OpenAI required format
+    logger.info(f"Search for '{query}' returned {len(results)} results")
     return {"results": results}
 
-async def execute_fetch(arguments: dict) -> dict:
-    """Execute fetch tool - OpenAI format compliance"""
-    # OpenAI format uses 'id' parameter name
-    identifier = arguments.get("id", "")
-    if not identifier:
-        # Fallback for compatibility
-        identifier = arguments.get("identifier", "")
+async def fetch(id: str) -> Dict[str, Any]:
+    """
+    Retrieve complete user details by unique identifier.
+    
+    Args:
+        id: Unique identifier for the user (user ID or email address)
         
-    # Auto-detect type based on content
-    id_type = "email" if "@" in identifier else "id"
+    Returns:
+        Complete user profile with id, title, full text content, optional URL, and metadata
+    """
+    if not id:
+        raise ValueError("User ID is required")
     
     user = None
-    if id_type == "id" or identifier.isdigit():
+    
+    # Try to get by ID first
+    if id.isdigit():
         try:
-            user_id = int(identifier)
+            user_id = int(id)
             user = db.get_user(user_id)
         except ValueError:
             pass
-    elif id_type == "email" or "@" in identifier:
+    
+    # If not found, try by email
+    if not user and "@" in id:
         users = db.get_users()
         for u in users:
-            if u.email.lower() == identifier.lower():
+            if u.email.lower() == id.lower():
                 user = u
                 break
     
     if user:
-        # Format according to OpenAI specification
-        return {
+        result = {
             "id": str(user.id),
             "title": f"User Profile: {user.name}",
             "text": f"Complete user profile for {user.name}\n\nContact Information:\n- Email: {user.email}\n- User ID: {user.id}\n\nProfile Status: Active\nAccount Type: Standard User\n\nThis user record contains basic contact and identification information.",
@@ -194,89 +167,72 @@ async def execute_fetch(arguments: dict) -> dict:
                 "status": "active"
             }
         }
+        logger.info(f"Fetched user profile: {id}")
+        return result
     else:
-        # Return error in expected format
-        return {
-            "id": identifier,
-            "title": "User Not Found",
-            "text": f"No user found with identifier: {identifier}",
-            "url": None,
-            "metadata": None
-        }
+        raise ValueError(f"User not found with identifier: {id}")
 
-# API endpoints
-@app.get("/")
-async def root():
-    return {
-        "name": "ChatGPT MCP Server",
-        "version": "1.0.0",
-        "status": "running",
-        "description": "User Management MCP Server for ChatGPT",
-        "endpoints": {
-            "tools": "/tools",
-            "call": "/call", 
-            "health": "/health",
-            "docs": "/docs"
-        },
-        "deployment": "Railway Cloud"
-    }
+# FastAPI app setup
+app = FastAPI(
+    title="FastMCP Compatible Server",
+    description="MCP Server compatible with ChatGPT Deep Research",
+    version="1.0.0"
+)
 
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
-    try:
-        users = db.get_users()
-        return {
-            "status": "healthy",
-            "database": "connected",
-            "users_count": len(users),
-            "environment": "production"
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy", 
-            "error": str(e)
-        }
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"]
+)
 
+# MCP SSE Transport (模擬 FastMCP 的 transport="sse" 行為)
 @app.get("/sse/")
-async def sse_endpoint():
+async def mcp_sse_transport():
     """
-    SSE (Server-Sent Events) endpoint as required by OpenAI MCP specification
-    This is the streaming interface that ChatGPT uses to connect
+    MCP SSE Transport - 模擬 FastMCP 的內建 SSE transport
+    這個端點實作了與 ChatGPT 相容的 MCP over SSE 協議
     """
-    from fastapi.responses import StreamingResponse
-    import json
-    import asyncio
     
-    async def event_stream():
-        # Send MCP compliant server capabilities - following official MCP protocol
-        mcp_spec = {
-            "capabilities": {
-                "tools": {
-                    "listChanged": True
+    async def mcp_stream():
+        # 1. 發送初始化訊息 (類似 FastMCP 的初始化)
+        init_response = {
+            "jsonrpc": "2.0",
+            "id": None,
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {
+                    "tools": {},
+                    "resources": {},
+                    "prompts": {},
+                    "logging": {}
                 },
-                "resources": {},
-                "prompts": {},
-                "logging": {}
-            },
-            "serverInfo": {
-                "name": "ChatGPT MCP Server",
-                "version": "1.0.0",
-                "protocolVersion": "2025-06-18"
-            },
-            "instructions": "This MCP server provides user management capabilities for ChatGPT integration. Use the search tool to find relevant users based on keywords, then use the fetch tool to retrieve complete user profile information with citations."
+                "serverInfo": {
+                    "name": "FastMCP Compatible Server",
+                    "version": "1.0.0"
+                },
+                "instructions": "This MCP server provides user management capabilities for ChatGPT integration. Use the search tool to find relevant users based on keywords, then use the fetch tool to retrieve complete user profile information with citations."
+            }
         }
         
-        yield f"data: {json.dumps(mcp_spec)}\n\n"
+        yield f"data: {json.dumps(init_response)}\n\n"
         
-        # Keep connection alive with heartbeat
+        # 2. 主要的 message loop (模擬 FastMCP 的 message handling)
         while True:
             await asyncio.sleep(30)
-            heartbeat = {"type": "heartbeat", "timestamp": asyncio.get_event_loop().time()}
+            # 發送 heartbeat
+            heartbeat = {
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {"level": "info", "message": "Server heartbeat"}
+            }
             yield f"data: {json.dumps(heartbeat)}\n\n"
     
     return StreamingResponse(
-        event_stream(), 
+        mcp_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -285,31 +241,21 @@ async def sse_endpoint():
         }
     )
 
-@app.get("/capabilities")
-async def capabilities():
-    """MCP server capabilities endpoint"""
-    return {
-        "capabilities": {
-            "tools": True,
-            "resources": False,
-            "prompts": False,
-            "logging": False
-        },
-        "serverInfo": {
-            "name": "ChatGPT MCP Server",
-            "version": "1.0.0",
-            "protocolVersion": "2025-06-18"
-        },
-        "instructions": "This server provides user management tools for ChatGPT integration"
-    }
-
-# JSON-RPC 2.0 endpoint for MCP protocol
-@app.post("/mcp")
-async def mcp_jsonrpc(request: JSONRPCRequest) -> JSONRPCResponse:
-    """MCP JSON-RPC 2.0 endpoint"""
+# MCP JSON-RPC endpoints (模擬 FastMCP 的 RPC 處理)
+@app.post("/")
+async def mcp_jsonrpc(request: Request):
+    """
+    主要的 MCP JSON-RPC 端點
+    模擬 FastMCP 處理 tools/list 和 tools/call 的方式
+    """
     try:
-        if request.method == "tools/list":
-            # Return MCP compliant tools list
+        body = await request.json()
+        method = body.get("method")
+        params = body.get("params", {})
+        rpc_id = body.get("id")
+        
+        if method == "tools/list":
+            # 返回工具列表 (模擬 FastMCP 自動生成的工具定義)
             tools = [
                 {
                     "name": "search",
@@ -318,7 +264,7 @@ async def mcp_jsonrpc(request: JSONRPCRequest) -> JSONRPCResponse:
                         "type": "object",
                         "properties": {
                             "query": {
-                                "type": "string", 
+                                "type": "string",
                                 "description": "Search query string for user names or email addresses"
                             }
                         },
@@ -341,250 +287,92 @@ async def mcp_jsonrpc(request: JSONRPCRequest) -> JSONRPCResponse:
                 }
             ]
             
-            return JSONRPCResponse(
-                id=request.id,
-                result={"tools": tools}
-            )
-            
-        elif request.method == "tools/call":
-            # Handle tool execution via JSON-RPC
-            params = request.params
+            return {
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "result": {"tools": tools}
+            }
+        
+        elif method == "tools/call":
+            # 執行工具調用 (模擬 FastMCP 的工具執行)
             tool_name = params.get("name")
             arguments = params.get("arguments", {})
             
             if tool_name == "search":
-                search_result = await execute_search(arguments)
-                return JSONRPCResponse(
-                    id=request.id,
-                    result=search_result
-                )
-                
-            elif tool_name == "fetch":
-                fetch_result = await execute_fetch(arguments)
-                return JSONRPCResponse(
-                    id=request.id,
-                    result=fetch_result
-                )
-            else:
-                return JSONRPCResponse(
-                    id=request.id,
-                    error={
-                        "code": -32601,
-                        "message": f"Method not found: {tool_name}",
-                        "data": {"available_tools": ["search", "fetch"]}
-                    }
-                )
-        else:
-            return JSONRPCResponse(
-                id=request.id,
-                error={
-                    "code": -32601,
-                    "message": f"Method not found: {request.method}",
-                    "data": {"available_methods": ["tools/list", "tools/call"]}
+                result = await search(**arguments)
+                return {
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "result": result
                 }
-            )
             
-    except Exception as e:
-        return JSONRPCResponse(
-            id=request.id,
-            error={
-                "code": -32603,
-                "message": "Internal error",
-                "data": str(e)
-            }
-        )
-
-@app.get("/tools")
-async def list_tools():
-    """List all available MCP tools (Legacy endpoint)"""
-    tools = [
-        {
-            "name": "search",
-            "description": "Search for users in the database. Returns a list of potentially relevant users based on the search query (REQUIRED for ChatGPT Deep Research)",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string", 
-                        "description": "Search query string for user names or email addresses"
+            elif tool_name == "fetch":
+                try:
+                    result = await fetch(**arguments)
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": rpc_id,
+                        "result": result
                     }
-                },
-                "required": ["query"]
-            }
-        },
-        {
-            "name": "fetch",
-            "description": "Retrieve complete user details by unique identifier. Returns full user profile information (REQUIRED for ChatGPT Deep Research)",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "Unique identifier for the user (user ID or email address)"
+                except ValueError as e:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": rpc_id,
+                        "error": {
+                            "code": -1,
+                            "message": str(e)
+                        }
                     }
-                },
-                "required": ["id"]
-            }
-        },
-        {
-            "name": "create_user",
-            "description": "Create a new user",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "User name"},
-                    "email": {"type": "string", "description": "User email"}
-                },
-                "required": ["name", "email"]
-            }
-        },
-        {
-            "name": "list_users",
-            "description": "List all users",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "description": "Max users", "default": 50}
+            
+            else:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": {
+                        "code": -32601,
+                        "message": f"Unknown tool: {tool_name}"
+                    }
+                }
+        
+        else:
+            return {
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "error": {
+                    "code": -32601,
+                    "message": f"Unknown method: {method}"
                 }
             }
-        },
-        {
-            "name": "get_user",
-            "description": "Get user by ID",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "user_id": {"type": "integer", "description": "User ID"}
-                },
-                "required": ["user_id"]
-            }
-        },
-        {
-            "name": "update_user",
-            "description": "Update user information",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "user_id": {"type": "integer", "description": "User ID"},
-                    "name": {"type": "string", "description": "New name"},
-                    "email": {"type": "string", "description": "New email"}
-                },
-                "required": ["user_id", "name", "email"]
-            }
-        },
-        {
-            "name": "delete_user",
-            "description": "Delete a user",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "user_id": {"type": "integer", "description": "User ID"}
-                },
-                "required": ["user_id"]
+    
+    except Exception as e:
+        logger.error(f"JSON-RPC error: {e}")
+        return {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "error": {
+                "code": -32603,
+                "message": "Internal error"
             }
         }
-    ]
-    
-    return {"tools": tools}
 
-@app.post("/call")
-async def call_tool(request: MCPToolCall) -> MCPResponse:
-    """Execute MCP tool call"""
-    try:
-        name = request.name
-        arguments = request.arguments
-        
-        if name == "search":
-            # Return the raw dictionary format as required by OpenAI
-            search_result = await execute_search(arguments)
-            return MCPResponse(result=search_result)
-                
-        elif name == "fetch":
-            # Return the raw dictionary format as required by OpenAI
-            fetch_result = await execute_fetch(arguments)
-            return MCPResponse(result=fetch_result)
-        elif name == "create_user":
-            user = User(**arguments)
-            created = db.create_user(user)
-            result = f"Created user: ID={created.id}, Name={created.name}, Email={created.email}"
-        elif name == "list_users":
-            limit = arguments.get("limit", 50)
-            users = db.get_users()
-            if not users:
-                result = "No users in database"
-            else:
-                limited = users[:limit]
-                result = f"Users ({len(limited)} of {len(users)}):\n"
-                for user in limited:
-                    result += f"ID: {user.id}, Name: {user.name}, Email: {user.email}\n"
-        elif name == "get_user":
-            user_id = arguments["user_id"]
-            user = db.get_user(user_id)
-            if user:
-                result = f"User: ID={user.id}, Name={user.name}, Email={user.email}"
-            else:
-                result = f"User not found: ID={user_id}"
-        elif name == "update_user":
-            user_id = arguments["user_id"]
-            user_data = User(name=arguments["name"], email=arguments["email"])
-            updated = db.update_user(user_id, user_data)
-            if updated:
-                result = f"Updated: ID={updated.id}, Name={updated.name}, Email={updated.email}"
-            else:
-                result = f"User not found: ID={user_id}"
-        elif name == "delete_user":
-            user_id = arguments["user_id"]
-            success = db.delete_user(user_id)
-            if success:
-                result = f"Deleted user: ID={user_id}"
-            else:
-                result = f"User not found: ID={user_id}"
-        else:
-            return MCPResponse(error=f"Unknown tool: {name}")
-            
-        return MCPResponse(result=result)
-        
-    except Exception as e:
-        return MCPResponse(error=str(e))
+# Health check
+@app.get("/")
+async def root():
+    return {
+        "name": "FastMCP Compatible Server",
+        "version": "1.0.0", 
+        "status": "running",
+        "description": "MCP Server compatible with ChatGPT Deep Research (FastMCP style)",
+        "sse_endpoint": "/sse/",
+        "users_count": len(db.get_users())
+    }
 
-# Add sample data on startup
-@app.on_event("startup")
-async def startup_event():
-    """Initialize with sample data"""
-    try:
-        users = db.get_users()
-        if len(users) == 0:
-            sample_users = [
-                User(name="Alice Johnson", email="alice@example.com"),
-                User(name="Bob Smith", email="bob@example.com"),
-                User(name="Carol Brown", email="carol@test.com"),
-                User(name="David Wilson", email="david@demo.com"),
-                User(name="Eva Garcia", email="eva@sample.com")
-            ]
-            
-            for user in sample_users:
-                try:
-                    db.create_user(user)
-                except:
-                    pass
-                    
-            print(f"[SUCCESS] Initialized with {len(sample_users)} sample users")
-        else:
-            print(f"[INFO] Database has {len(users)} existing users")
-    except Exception as e:
-        print(f"[WARNING] Startup warning: {e}")
-
-# Railway deployment configuration
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 8000))
     
-    print("[START] Starting ChatGPT MCP Server for Railway deployment...")
-    print(f"[PORT] Port: {port}")
-    print("[SUCCESS] Ready for ChatGPT integration!")
+    logger.info("Starting FastMCP Compatible MCP Server...")
+    logger.info(f"SSE endpoint: http://0.0.0.0:{port}/sse/")
+    logger.info("Server ready for ChatGPT integration!")
     
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
